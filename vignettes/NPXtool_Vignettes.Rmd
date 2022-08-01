@@ -1,0 +1,248 @@
+---
+title: "Normalization_Workflow_Template"
+author: "Jingjing Qi, Icahn School of Medicine"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Normalization_Workflow_Template}
+  %\VignetteEngine{knitr::rmarkdown}
+  \usepackage[utf8]{inputenc}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Input File Names
+
+```{r, eval=F}
+library(tidyverse) 
+library(NPXtools)
+#library(magrittr)
+#library(tidyr)
+#library(SummarizedExperiment)
+```
+
+```{r,eval=F}
+f.list <- c("~/Downloads/ERGU01_48x48_Plate1_05182021_QUANT.xlsx", 
+            "~/Downloads/ERGU01_48x48_Plate2_05182021_QUANT.xlsx")
+names(f.list) <- f.list
+
+# QUANT file format: startrow = 9
+# NPX file format: startrow = 8
+f.list <- lapply(f.list, read_npx, startrow = 9)
+
+# inspect sample object list
+f.list
+```
+
+
+```{r, eval=F}
+library(aws.s3)
+
+Sys.setenv()
+
+my_Bucket <- bucketlist()
+#---
+my_Bucket <- my_Bucket[my_Bucket$Bucket == "", 1]
+my_Bucket_file <- get_bucket(my_Bucket, prefix = "xxxxxx", max = Inf)
+f.list <- sapply(my_Bucket_file, function(x){
+  x[[1]]
+}) 
+f.list <- f.list[grepl(".*NPX.xlsx", f.list)]
+
+
+names(f.list) <- f.list
+
+# QUANT file format: startrow = 9
+# NPX file format: startrow = 8
+f.list <- lapply(f.list, function(x){
+  temp <- try(s3read_using(FUN = read_npx, object = x, bucket = my_Bucket, startrow = 8))
+  temp$f_name <- x
+  temp
+})
+```
+
+
+```{r, eval=F}
+match2location <- function(se, 
+                           byrow = T, 
+                           drop_list_pattern = "HDPlasma_1017"){
+  
+  if(!is.null(drop_list_pattern)){
+    drop_patter <- paste0("(", paste(drop_list_pattern, collapse = "|"), ")")
+    se <- se[ , !(grepl(drop_patter, se$Assay))]
+  }
+  if(ncol(se) != 88) stop("total sample is not 88!\n")
+  
+  dev_value <- pmax(se$QC.Deviation.from.median, se$QC.Deviation.from.median.1)
+  dev_value[is.na(dev_value)] <- max(as.numeric(dev_value), na.rm = T) 
+  
+  mat <- matrix(nrow = 8, ncol = 11)
+  if(byrow){
+    for (i in 0 : 7) {
+      mat[i+1, ] <- abs(as.numeric(dev_value[(1 + i*11) : (11 + i*11)])) 
+    }
+  }else{
+     for (i in 0 : 10) {
+      mat[ , i+1] <- abs(as.numeric(dev_value[(1 + i*8) : (8 + i*8)]))
+    } 
+  }
+  return(mat)
+}
+
+```
+
+
+### Locatioin-wise heatmap
+
+```{r, eval=F}
+match2location <- function(se, 
+                           byrow = T, 
+                           drop_list_pattern = "HDPlasma_1017"){
+  
+  if(!is.null(drop_list_pattern)){
+    drop_patter <- paste0("(", paste(drop_list_pattern, collapse = "|"), ")")
+    se <- se[ , !(grepl(drop_patter, se$Assay))]
+  }
+  if(ncol(se) != 88) stop("total sample is not 88!\n")
+  
+  dev_value <- pmax(se$QC.Deviation.from.median, se$QC.Deviation.from.median.1)
+  dev_value[is.na(dev_value)] <- max(as.numeric(dev_value), na.rm = T) 
+  
+  mat <- matrix(nrow = 8, ncol = 11)
+  if(byrow){
+    for (i in 0 : 7) {
+      mat[i+1, ] <- abs(as.numeric(dev_value[(1 + i*11) : (11 + i*11)])) 
+    }
+  }else{
+     for (i in 0 : 10) {
+      mat[ , i+1] <- abs(as.numeric(dev_value[(1 + i*8) : (8 + i*8)]))
+    } 
+  }
+  return(mat)
+}
+
+
+mats <- lapply(f.list, function(x){
+  temp <- match2location(x, byrow = T)
+  rownames(temp) <- paste("row", 1:nrow(temp), sep = "_")
+  colnames(temp) <- paste("col", 1:ncol(temp), sep = "_")
+  print(pheatmap::pheatmap(temp, 
+                           cluster_rows = F, cluster_cols = F, 
+                           scale = "none", 
+                           display_numbers = round(temp, 2))
+        )
+})
+
+```
+
+### Inspect Sample Name, Create Reference Sample Objects
+
+```{r, eval=F}
+# inspect sample name
+f.list[[1]]$Assay
+
+bridge.ls <- pull_bdg(f.list, pattern = "HD Pool 1017", fields = "Assay")
+
+# inspect reference sample object list
+bridge.ls
+```
+
+### Run Normalization Code
+
+```{r, eval=F}
+# select desired methods to creat the inter-object reference: mean, median, max
+# use max can avoid have potential negative values in the normalized data
+f.list <- bdg_norm(bridge.ls = bridge.ls, data.ls = f.list, between.plate.method = "max")
+```
+
+### Merge List of Normalized Objects and Generate Plots 
+
+```{r, eval=F}
+f.list <- cmb_npx_se(f.list)
+
+plot_npx_norm_qc(normed_se = f.list, bridge_pattern= "HD Pool 1017", fields = "Assay", example = "VEGFA",
+        Randox = F, randox_info_f = "~/Desktop/Olink/Randox_info.csv")
+
+```
+
+### Summarize Percentage Missing
+```{r, eval=F}
+data.frame(na_count = apply(f.list@assays@data$npx, 1, function(x){
+  sum(is.na(x))
+}))%>%
+  rownames_to_column(var = "Analyt")%>%
+  filter(na_count != 0)
+
+mat <- f.list@assays@data$npx
+mat[is.na(mat)] <- -3.14 
+
+```
+
+### Summarize below LOD
+```{r, eval=F}
+data.frame(Analyt = rownames(mat)%>%make.names(),
+           lod  = f.list@elementMetadata$LOD%>%as.numeric(),
+           lt_lod = sapply(1 : nrow(mat), function(x){
+  round(sum(mat[x, ] < f.list@elementMetadata$LOD[x]%>%as.numeric(), na.rm = T)/ncol(mat)*100, 2)
+}))%>%
+  #filter(lt_lod != 0)%>%
+  left_join(data.frame(mat)%>%
+              rownames_to_column(var = "Analyt"))%>%
+  mutate(lt_lod = paste(lt_lod, "%"))%>%
+  gather(-Analyt, -lt_lod, -lod, key = "sample", value = "value")%>%
+  ggplot()+
+  geom_jitter(aes(Analyt, value), shape = 21, color = "grey")+
+  geom_jitter(aes(Analyt, lod), shape = 11, color = "red")+
+  geom_text(aes(Analyt, lod, label = lt_lod))+
+  labs(title = "Count of Analyt with value less than LOD", y = "NPX")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), 
+        legend.position = "bottom")
+```
+
+### Summarize Warning
+
+```{r, eval=F}
+data.frame(f.list@colData@listData)%>%
+  select(QC.Deviation.from.median, QC.Deviation.from.median.1, Plate.ID, QC.Warning)%>%
+  group_by(Plate.ID, QC.Warning)%>%
+  summarise(n = n())
+```
+
+### QC Warning Distribution 
+
+```{r, eval=F}
+cutoff <- 0.35
+data.frame(abs_dev = abs(as.numeric(pmax(f.list$QC.Deviation.from.median, f.list$QC.Deviation.from.median.1))) < cutoff,
+           t(f.list@assays@data$npx))%>%
+  gather(-abs_dev, key = "analyt", value = "value")%>%
+  ggplot()+
+  #geom_boxplot(aes(value, fill = abs_dev), alpha = 0.6)+
+  geom_point(aes(abs_dev, value, color = abs_dev))+
+  facet_wrap(~analyt, nrow = 6)+
+  theme_bw()+
+  guides(fill = "none")
+```
+
+### Optional Heatmap
+
+```{r, eval=F}
+coldata <- data.frame(sample = f.list$Assay,
+                      plate = f.list$Plate.ID)%>%
+  mutate(type = toupper(gsub("^.*_", "", sample)))
+
+mat <- f.list@assays@data$inlot_normed
+rownames(coldata) <- colnames(mat)
+pheatmap::pheatmap(mat, cluster_cols = T, cluster_rows = F, scale = "row", annotation_col = coldata, 
+                   color = colorRampPalette(rev(RColorBrewer::brewer.pal(n = 10, name = "RdYlBu")))(150),
+                   show_colnames = F, fontsize = 10, fontsize_row = 12)
+
+```
+
+### Save Data to CSV
+
+```{r, eval=F}
+save_npx_csv(se = f.list, pre_fix = "~/Desktop/ERGU01_48x48_QUANT_", assay2save = c("npx", "inlot_normed"))
+```
+
